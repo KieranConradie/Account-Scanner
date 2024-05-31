@@ -1,0 +1,227 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation script that will create an SNS topic to trigger a Lambda function to send an email
+
+Parameters:
+  MemorySize:
+    Type: Number
+    Default: 128
+    Description: "Memory size for Lambda"
+
+  Timeout:
+    Type: Number
+    Default: 900
+    Description: Timeout for Lambda
+
+  Runtime:
+    Type: String
+    Default: "python3.9"
+    Description: "Runtime for Lambda function which is python3.9"
+
+  Handler:
+    Type: String
+    Default: "index.lambda_handler"
+    Description: "Lambda handler"
+
+  Region:
+    Default: eu-west-1
+    Type: String
+
+  ACCOUNTNUMBER:
+    Type: String
+    Default: 311668141734
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: Scanner-tool-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPermissionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "iam:ListAccountAliases"
+                  - "ses:SendEmail"
+                  - "budgets:ViewBudget"
+                  - "ses:SendRawEmail"
+                  - "ce:GetCostAndUsage"
+                  - "ce:GetDimensionValues"
+                  - "budgets:DescribeBudgets"
+                  - "cur:DescribeReportDefinitions"
+                  - "sns:ListTopics"
+                  - "sts:GetCallerIdentity"
+                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Dailyevent:
+  #   Type: AWS::Events::Rule
+  #   Properties:
+  #     Name: "Cost-notification-daily"
+  #     ScheduleExpression: "cron(0 19 * * ? *)"
+  #     Targets:
+  #       - Arn: !GetAtt DailyLambda.Arn
+  #         Id: invoke-cn-lambda
+
+  LambdaPermissionDaily:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref ScannerLambda
+      Principal: "events.amazonaws.com"
+      # SourceArn: !GetAtt Dailyevent.Arn
+      SourceAccount: !Ref ACCOUNTNUMBER
+
+  ScannerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: Account-scanner-lambda
+      Role: !GetAtt LambdaRole.Arn
+      MemorySize: !Ref MemorySize
+      Timeout: !Ref Timeout
+      Handler: !Ref Handler
+      Runtime: !Ref Runtime
+      Environment:
+        Variables:
+          Region: !Ref Region
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta
+
+          logging.basicConfig(level=logging.INFO)
+          logger = logging.getLogger()
+
+          def lambda_handler(event, context):
+              ce_client = boto3.client('ce')  # Cost Explorer client
+              ses_client = boto3.client('ses')  # Simple Email Service client
+              budgets_client = boto3.client('budgets')  # Budgets client
+              sns_client = boto3.client('sns')  # SNS client
+              cohc_client = boto3.client('ce', region_name='us-east-1')  # Cost Optimization Hub client
+
+              sts = boto3.client('sts')
+              account_id = sts.get_caller_identity()["Account"]
+
+              iam = boto3.client('iam')
+              alias = iam.list_account_aliases()['AccountAliases'][0]
+              region = os.environ['Region']
+
+              # Check if hourly billing is enabled
+              try:
+                  billing_client = boto3.client('cur', region_name=region)
+                  response = billing_client.describe_report_definitions()
+                  logger.info(f"CUR Response: {response}")
+                  hourly_billing_enabled = any(report['TimeUnit'] == 'HOURLY' for report in response['ReportDefinitions'])
+              except Exception as e:
+                  logger.error(f"Error checking hourly billing: {e}")
+                  hourly_billing_enabled = False
+
+              # Check if budgets are set in the account
+              try:
+                  budgets_response = budgets_client.describe_budgets(AccountId=account_id)
+                  logger.info(f"Budgets Response: {budgets_response}")
+                  budgets_set = len(budgets_response['Budgets']) > 0
+              except Exception as e:
+                  logger.error(f"Error checking budgets: {e}")
+                  budgets_set = False
+
+              # Check if Cost Optimization Hub is enabled
+              try:
+                  cohc_response = cohc_client.get_cost_optimization_for_resource_configurations()
+                  logger.info(f"Cost Optimization Hub Response: {cohc_response}")
+                  cohc_enabled = bool(cohc_response.get('ResourceConfigurations'))
+              except Exception as e:
+                  logger.error(f"Error checking Cost Optimization Hub: {e}")
+                  cohc_enabled = False
+
+              # Collect information about budgets and their SNS topics
+              sns_topics_found = []
+              budget_info = []
+              if budgets_set:
+                  try:
+                      for budget in budgets_response['Budgets']:
+                          budget_name = budget['BudgetName']
+                          logger.info(f"Checking SNS topics for budget: {budget_name}")
+                          # Retrieve SNS topics associated with the budget
+                          sns_topics = budgets_client.describe_notifications_for_budget(
+                              AccountId=account_id,
+                              BudgetName=budget_name
+                          )
+                          logger.info(f"SNS Topics for {budget_name}: {sns_topics}")
+                          sns_topic_attached = bool(sns_topics.get('Notifications', []))
+                          budget_info.append({'BudgetName': budget_name, 'SNSAttached': sns_topic_attached})
+                          if sns_topic_attached:
+                              sns_topics_found.extend(sns_topics.get('Notifications', []))
+                  except Exception as e:
+                      logger.error(f"Error collecting budget info: {e}")
+
+              # Format email body
+              email_body = f"""
+              <table border='1' cellpadding='5'>
+                  <tr style='background-color: DodgerBlue'>
+                      <th>FINOPS Foundations Scanner</th>
+                      <th>Status</th>
+                  </tr>
+                  <tr>
+                      <td>hourly billing</td>
+                      <td style='background-color: {"red" if not hourly_billing_enabled else "green"}'>{"no" if not hourly_billing_enabled else "yes"}</td>
+                  </tr>
+                  <tr>
+                      <td>budgets set</td>
+                      <td style='background-color: {"red" if not budgets_set else "green"}'>{"no" if not budgets_set else "yes"}</td>
+                  </tr>
+                  <tr>
+                      <td>Cost Optimization Hub enabled</td>
+                      <td style='background-color: {"red" if not cohc_enabled else "green"}'>{"no" if not cohc_enabled else "yes"}</td>
+                  </tr>
+                  <tr>
+                      <td colspan="2">Budgets and SNS Topic Attachment:</td>
+                  </tr>
+              """
+              for info in budget_info:
+                  email_body += f"""
+                  <tr>
+                      <td>{info['BudgetName']}</td>
+                      <td style='background-color: {"red" if not info['SNSAttached'] else "green"}'>{"no" if not info['SNSAttached'] else "yes"}</td>
+                  </tr>
+              """
+              email_body += """
+              </table>
+              """
+
+              response = ses_client.send_email(
+                  Source='kieranconradie71@gmail.com',
+                  Destination={
+                      'ToAddresses': ['kieranconradie71@gmail.com'],
+                  },
+                  Message={
+                      'Subject': {'Data': f'FINOPS Foundations Scanner Results for {alias} - {account_id}'},
+                      'Body': {'Html': {'Data': email_body}}
+                  }
+              )
+
+              logger.info(f"Email Response: {response}")
+
+              return {
+                  'statusCode': 200,
+                  'body': 'Email sent successfully!',
+                  'hourly_billing_enabled': hourly_billing_enabled,
+                  'budgets_set': budgets_set,
+                  'cohc_enabled': cohc_enabled,
+                  'sns_topics_found': sns_topics_found
+              }
+
+
+
